@@ -198,5 +198,6 @@ guest-net"}
 static uint32_t g_accent __attribute__((unused)) = 0x00FF66;  // runtime UI accent (Settings > theme)
 #define TR_THEME_GREEN    g_accent        // accent is now runtime-themeable
 static bool g_radarAudioOn __attribute__((unused)) = true;    // radar "getting warmer" ping (Settings toggle)
+static bool g_gpsOn        __attribute__((unused)) = false;   // GPS logging for wardrive: OFF by default (privacy + battery)
 #define TR_THEME_BG       0x000000
 #define TR_SETTINGS_FILE  "/tunnelrat/settings.txt"

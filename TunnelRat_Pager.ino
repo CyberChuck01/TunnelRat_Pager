@@ -525,8 +525,21 @@ static void build_pagerwd(lv_obj_t *root){
   lv_label_set_text(lbl_wd_state,g_wardriving?"PAGER WARDRIVE  - RUNNING":"PAGER WARDRIVE  - STOPPED");
 
   wd_gps=lv_label_create(col);
-  lv_label_set_text(wd_gps,"GPS: SEARCHING (scanning still allowed)");
-  lv_obj_set_style_text_color(wd_gps,lv_color_hex(0xF0C64B),0);
+  lv_label_set_text(wd_gps,g_gpsOn?"GPS: SEARCHING (scanning still allowed)":"GPS: OFF - not logging location (privacy)");
+  lv_obj_set_style_text_color(wd_gps,lv_color_hex(g_gpsOn?0xF0C64B:0x7FB0FF),0);
+
+  // GPS logging toggle: OFF = chip idle, no coordinates logged (privacy + battery)
+  lv_obj_t *gpsrow=make_row(col,34);
+  lv_obj_set_flex_align(gpsrow,LV_FLEX_ALIGN_START,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+  lv_obj_t *gl=lv_label_create(gpsrow); lv_label_set_text(gl,"Log GPS location");
+  lv_obj_set_flex_grow(gl,1); lv_obj_set_style_text_color(gl,lv_color_hex(0xC8C8C8),0);
+  lv_obj_t *gsw=lv_switch_create(gpsrow);
+  lv_obj_set_style_bg_color(gsw,lv_color_hex(g_accent),LV_PART_INDICATOR|LV_STATE_CHECKED);
+  if(g_gpsOn) lv_obj_add_state(gsw,LV_STATE_CHECKED);
+  lv_obj_add_event_cb(gsw,[](lv_event_t*e){
+    g_gpsOn=lv_obj_has_state((lv_obj_t*)lv_event_get_target(e),LV_STATE_CHECKED);
+    settings_save();
+  },LV_EVENT_VALUE_CHANGED,nullptr);
 
   lbl_sel=make_tab_label(col,"Sensors: ");
   lv_label_set_long_mode(lbl_sel,LV_LABEL_LONG_DOT);
@@ -704,10 +717,15 @@ static bool reset_was_abnormal(){
 static void ui_refresh_pagerwd() {
   if (g_mode != MODE_PAGER_WD || !wd_gps) return;
   char g[80];
-  if (g_gps.valid) snprintf(g,sizeof g,"GPS: LOCKED  %.5f, %.5f  %dsat",g_gps.lat,g_gps.lon,g_gps.sats);
-  else             snprintf(g,sizeof g,"GPS: SEARCHING (%d sat) - WiGLE rows wait for a fix",g_gps.sats);
-  lv_label_set_text(wd_gps,g);
-  lv_obj_set_style_text_color(wd_gps,lv_color_hex(g_gps.valid?0x53F59B:0xF0C64B),0);
+  if (!g_gpsOn) {
+    lv_label_set_text(wd_gps,"GPS: OFF - not logging location (privacy)");
+    lv_obj_set_style_text_color(wd_gps,lv_color_hex(0x7FB0FF),0);
+  } else {
+    if (g_gps.valid) snprintf(g,sizeof g,"GPS: LOCKED  %.5f, %.5f  %dsat",g_gps.lat,g_gps.lon,g_gps.sats);
+    else             snprintf(g,sizeof g,"GPS: SEARCHING (%d sat) - WiGLE rows wait for a fix",g_gps.sats);
+    lv_label_set_text(wd_gps,g);
+    lv_obj_set_style_text_color(wd_gps,lv_color_hex(g_gps.valid?0x53F59B:0xF0C64B),0);
+  }
   if(wd_counters[0]) lv_label_set_text_fmt(wd_counters[0],"WiFi\n%lu",(unsigned long)g_count.wifi);
   if(wd_counters[1]) lv_label_set_text_fmt(wd_counters[1],"BLE\n%lu",(unsigned long)g_count.ble);
   if(wd_counters[2]) lv_label_set_text_fmt(wd_counters[2],"Mesh\n%lu",(unsigned long)g_count.mesh);
@@ -1051,6 +1069,7 @@ static void nmea_send(TrGps &g){
 }
 
 static void gps_tick(){
+  if(!g_gpsOn){ g_gps.valid=false; g_gps.sats=0; return; }   // GPS off: don't pump, don't fix
   instance.gps.loop();                        // pump the GPS UART
   auto &g = instance.gps;
   g_gps.sats = g.satellites.isValid()? g.satellites.value() : 0;
@@ -1468,7 +1487,7 @@ static void settings_save(){
   if(!tr_spi_lock()) return;
   SD.remove(TR_SETTINGS_FILE);
   File f=SD.open(TR_SETTINGS_FILE, FILE_WRITE);
-  if(f){ f.printf("accent=%06x\n",(unsigned)(g_accent&0xFFFFFF)); f.printf("bright=%d\n",(int)g_bright); f.printf("audio=%d\n",g_radarAudioOn?1:0); f.close(); }
+  if(f){ f.printf("accent=%06x\n",(unsigned)(g_accent&0xFFFFFF)); f.printf("bright=%d\n",(int)g_bright); f.printf("audio=%d\n",g_radarAudioOn?1:0); f.printf("gps=%d\n",g_gpsOn?1:0); f.close(); }
   tr_spi_unlock();
 }
 static void settings_load(){
@@ -1481,6 +1500,7 @@ static void settings_load(){
       if(ln.startsWith("accent=")) g_accent=(uint32_t)strtoul(ln.substring(7).c_str(),nullptr,16);
       else if(ln.startsWith("bright=")){ int b=ln.substring(7).toInt(); if(b<1)b=1; if(b>DEVICE_MAX_BRIGHTNESS_LEVEL)b=DEVICE_MAX_BRIGHTNESS_LEVEL; g_bright=(uint8_t)b; }
       else if(ln.startsWith("audio=")) g_radarAudioOn = (ln.substring(6).toInt()!=0);
+      else if(ln.startsWith("gps="))   g_gpsOn        = (ln.substring(4).toInt()!=0);
     }
     f.close();
   }

@@ -41,6 +41,11 @@ struct GpsSnap {
 };
 
 inline void gps_snapshot(GpsSnap &o) {
+  if (!g_gpsOn) {                 // GPS logging disabled: never stamp a location
+    o.valid = o.alt_valid = o.hdop_valid = o.utc_valid = false;
+    o.utc[0] = 0;
+    return;
+  }
   auto &gps = instance.gps;
   o.valid = gps.location.isValid() && gps.location.age() < 5000;
   o.alt_valid = o.valid && gps.altitude.isValid() && gps.altitude.age() < 5000;

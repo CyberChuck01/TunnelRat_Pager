@@ -85,7 +85,7 @@
 // ===========================================================================
 enum Mode { MODE_LAUNCHER, MODE_TUNNELRAT, MODE_PAGER_WD, MODE_WIFI_ATTACKS, MODE_CONTACTS,
             MODE_NFC, MODE_EVILPORTAL, MODE_BLE, MODE_COMMS, MODE_NRF24,
-            MODE_WIFIRADAR, MODE_BTRADAR, MODE_CC1101, MODE_SETTINGS, MODE_SDEXP, MODE_MP3 };
+            MODE_WIFIRADAR, MODE_BTRADAR, MODE_CC1101, MODE_SETTINGS, MODE_SDEXP, MODE_MP3, MODE_WIFIMGR };
 static Mode g_mode = MODE_LAUNCHER;
 
 static lv_obj_t *g_scr_launcher = nullptr;   // persistent home screen
@@ -107,6 +107,7 @@ struct GpsState { bool valid=false; double lat=0,lon=0,alt=0; uint8_t sats=0; } 
 
 static volatile bool g_wardriving=false;
 bool g_uplink=false, g_sdOk=false;
+static char g_wifiSSID[33]="", g_wifiPASS[65]="";   // last WiFi join (shared with the remote uplink)
 uint32_t g_lastWifi=0, g_lastBle=0, g_lastUpload=0;
 WiFiUDP g_udp;
 bool g_trRadios=false;   // are the wardrive radios (BLE/mesh) currently up?
@@ -254,6 +255,7 @@ static const LItem LITEMS[] = {
   {LV_SYMBOL_SETTINGS  " Settings (theme + brightness)",  MODE_SETTINGS,     true,                 CAT_SYSTEM},
   {LV_SYMBOL_DRIVE     "  SD Explorer (file manager)",    MODE_SDEXP,        true,                 CAT_SYSTEM},
   {LV_SYMBOL_AUDIO     "  Music Player (MP3)",            MODE_MP3,          true,                 CAT_SYSTEM},
+  {LV_SYMBOL_WIFI      "  WiFi Connect (scan + join)",    MODE_WIFIMGR,      true,                 CAT_SYSTEM},
 };
 
 static lv_obj_t *g_launcher_list=nullptr;
@@ -594,8 +596,9 @@ static void nwd_stat_cb(lv_event_t*){  nwd_run("STATUS",TR_NANOPI_WD_STATUS); }
 static lv_obj_t *g_netOut=nullptr, *g_osintOut=nullptr;
 static const char *NET_TOOLS[][2]   = {{"LAN Scan","nmap-scan"},{"WiFi Scan","wifi-scan"},{"ARP","arp-table"},
                                        {"Ports","ports"},{"Routes","routes"},{"DNS","dns-test"}};
-static const char *OSINT_TOOLS[][2] = {{"Ext IP","myip"},{"Real IP","myip-real"},{"Tor Start","tor-start"},
-                                       {"Tor NewID","tor-newid"},{"Tor IP","tor-ip"},{"Tor Stat","tor-status"}};
+static const char *OSINT_TOOLS[][2] = {{"Ext IP","myip"},{"Real IP","myip-real"},{"GeoIP","geoip"},
+                                       {"Tor Start","tor-start"},{"Tor NewID","tor-newid"},{"Tor IP","tor-ip"},
+                                       {"Tor Stat","tor-status"}};
 
 // Run a dashboard action over /api/remote/run and show its output. Synchronous
 // (same pattern as the other remote calls); a scan can take several seconds.
@@ -624,10 +627,10 @@ static void osint_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_
 static void build_tool_tab(lv_obj_t *tab, bool net){
   lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(tab, 4, 0);
-  for(int row=0; row<2; row++){
-    lv_obj_t *r = make_row(tab, 34);
-    for(int c=0;c<3;c++){
-      int i=row*3+c;
+  int count = net ? 6 : 7;
+  for(int i=0;i<count;){
+    lv_obj_t *r = make_row(tab, 32);
+    for(int c=0;c<3 && i<count;c++,i++){
       const char *lbl = net ? NET_TOOLS[i][0] : OSINT_TOOLS[i][0];
       const char *act = net ? NET_TOOLS[i][1] : OSINT_TOOLS[i][1];
       make_button(r, lbl, 0x173017, net ? net_tool_cb : osint_tool_cb, (void*)act);
@@ -1018,7 +1021,7 @@ static void uplink_tick(){
   uint32_t now=millis();
   if(g_lastJoin && now-g_lastJoin<TR_RECONNECT_MS) return;
   g_lastJoin=now?now:1;
-  WiFi.begin(TR_AP_SSID,TR_AP_PASS);
+  WiFi.begin(TR_AP_SSID, (g_wifiPASS[0] && strcmp(g_wifiSSID,TR_AP_SSID)==0) ? g_wifiPASS : TR_AP_PASS);
 #endif
 }
 
@@ -1990,6 +1993,167 @@ static void mp3_leave(){
   g_mp3Now=g_mp3Time=g_mp3Bar=g_mp3PlayLbl=nullptr;
 }
 
+// ======================= WiFi CONNECT (STA manager) =====================
+// Scan nearby APs, join one by typing its password on the keyboard, and
+// remember the last connection on SD. Joining the NanoPi's own AP here also
+// brings up the Tunnel R.A.T. Remote uplink: uplink_tick() uses g_wifiPASS for
+// TR_AP_SSID when it's been saved, so you don't have to hard-code it in config.
+// Screen swaps are deferred (lv_async_call) so a tapped row isn't deleted
+// inside its own event (the SD-explorer footgun).
+static lv_obj_t *g_wm_parent=nullptr, *g_wm_list=nullptr, *g_wm_status=nullptr, *g_wm_pass=nullptr, *g_wmFocus=nullptr;
+static char g_wmSelSSID[33]="";
+
+static void wm_build_list();
+static void wm_build_pass();
+
+static void wifi_save_creds(){
+  if(!g_sdOk || !tr_spi_lock()) return;
+  SD.remove("/tunnelrat/wifi.txt");
+  File f=SD.open("/tunnelrat/wifi.txt",FILE_WRITE);
+  if(f){ f.printf("ssid=%s\npass=%s\n",g_wifiSSID,g_wifiPASS); f.close(); }
+  tr_spi_unlock();
+}
+static void wifi_load_creds(){
+  if(!g_sdOk || !tr_spi_lock()) return;
+  File f=SD.open("/tunnelrat/wifi.txt",FILE_READ);
+  if(f){
+    while(f.available()){
+      String ln=f.readStringUntil('\n'); ln.trim();
+      if(ln.startsWith("ssid=")){ strncpy(g_wifiSSID,ln.c_str()+5,sizeof g_wifiSSID-1); g_wifiSSID[sizeof g_wifiSSID-1]=0; }
+      else if(ln.startsWith("pass=")){ strncpy(g_wifiPASS,ln.c_str()+5,sizeof g_wifiPASS-1); g_wifiPASS[sizeof g_wifiPASS-1]=0; }
+    }
+    f.close();
+  }
+  tr_spi_unlock();
+}
+
+static void (*g_wmNext)()=nullptr;
+static void wm_async(void*){
+  void(*fn)()=g_wmNext; g_wmNext=nullptr;
+  if(!fn || g_mode!=MODE_WIFIMGR || !g_wm_parent) return;
+  fn();
+  nav_begin_screen(); nav_collect(g_scr_mode);
+  if(g_wmFocus) lv_group_focus_obj(g_wmFocus);
+  lv_group_set_editing(g_nav_group,false);
+}
+static void wm_go(void(*fn)()){ g_wmNext=fn; lv_async_call(wm_async,nullptr); }
+
+static void wm_do_scan(){
+  if(g_wm_status){ lv_label_set_text(g_wm_status,"Scanning..."); lv_refr_now(NULL); }
+  WiFi.mode(WIFI_STA);
+  WiFi.scanDelete();
+  WiFi.scanNetworks(false,false);              // blocking scan (~3-5s)
+  wm_go(wm_build_list);
+}
+static void wm_do_connect(){
+  const char *pw = g_wm_pass ? lv_textarea_get_text(g_wm_pass) : "";
+  if(!g_wmSelSSID[0]){ wm_go(wm_build_list); return; }
+  if(g_wm_status){ lv_label_set_text_fmt(g_wm_status,"Joining %s ...",g_wmSelSSID); lv_refr_now(NULL); }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(g_wmSelSSID, pw);
+  uint32_t t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<9000){ delay(150); lv_refr_now(NULL); }
+  if(WiFi.status()==WL_CONNECTED){
+    strncpy(g_wifiSSID,g_wmSelSSID,sizeof g_wifiSSID-1); g_wifiSSID[sizeof g_wifiSSID-1]=0;
+    strncpy(g_wifiPASS,pw,sizeof g_wifiPASS-1);          g_wifiPASS[sizeof g_wifiPASS-1]=0;
+    wifi_save_creds();
+    g_uplink=true;
+  }
+  wm_go(wm_build_list);
+}
+
+static void wm_build_list(){
+  if(!g_wm_parent) return;
+  lv_obj_clean(g_wm_parent);
+  g_wm_list=nullptr; g_wm_pass=nullptr; g_wmFocus=nullptr;
+
+  g_wm_status=lv_label_create(g_wm_parent);
+  lv_label_set_long_mode(g_wm_status,LV_LABEL_LONG_WRAP); lv_obj_set_width(g_wm_status,lv_pct(74));
+  lv_obj_align(g_wm_status,LV_ALIGN_TOP_LEFT,0,0);
+  bool conn=(WiFi.status()==WL_CONNECTED);
+  if(conn) lv_label_set_text_fmt(g_wm_status,"Connected: %s  %s",WiFi.SSID().c_str(),WiFi.localIP().toString().c_str());
+  else     lv_label_set_text(g_wm_status,"Not connected. Scan, pick an AP, type the password.");
+  lv_obj_set_style_text_color(g_wm_status,lv_color_hex(conn?0x53F59B:g_accent),0);
+
+  lv_obj_t *sb=lv_button_create(g_wm_parent); lv_obj_set_size(sb,96,26);
+  lv_obj_align(sb,LV_ALIGN_TOP_RIGHT,0,0); lv_obj_set_style_bg_color(sb,lv_color_hex(0x1C6B34),0);
+  { lv_obj_t *l=lv_label_create(sb); lv_label_set_text(l,LV_SYMBOL_REFRESH " Scan"); lv_obj_center(l); }
+  lv_obj_add_event_cb(sb,[](lv_event_t*){ wm_do_scan(); },LV_EVENT_CLICKED,nullptr);
+  g_wmFocus=sb;
+
+  g_wm_list=lv_list_create(g_wm_parent);
+  lv_obj_set_size(g_wm_list,lv_pct(100),lv_pct(78)); lv_obj_align(g_wm_list,LV_ALIGN_BOTTOM_MID,0,0);
+  lv_obj_set_style_bg_color(g_wm_list,lv_color_hex(0x0E120E),0);
+
+  int16_t n=WiFi.scanComplete();
+  if(n<=0){ lv_list_add_text(g_wm_list,"(no scan yet - press Scan)"); return; }
+  if(n>24) n=24;
+  for(int i=0;i<n;i++){
+    String ss=WiFi.SSID(i); if(ss.length()==0) ss="(hidden)";
+    bool open=(WiFi.encryptionType(i)==WIFI_AUTH_OPEN);
+    char row[88];
+    snprintf(row,sizeof row,LV_SYMBOL_WIFI " %s  %lddBm%s", ss.c_str(), (long)WiFi.RSSI(i), open?"  (open)":"");
+    lv_obj_t *b=lv_list_add_button(g_wm_list,NULL,row);
+    lv_obj_add_event_cb(b,[](lv_event_t*ev){
+      int idx=(int)(intptr_t)lv_event_get_user_data(ev);
+      String s=WiFi.SSID(idx); strncpy(g_wmSelSSID,s.c_str(),sizeof g_wmSelSSID-1); g_wmSelSSID[sizeof g_wmSelSSID-1]=0;
+      wm_go(wm_build_pass);
+    },LV_EVENT_CLICKED,(void*)(intptr_t)i);
+  }
+}
+
+static void wm_build_pass(){
+  if(!g_wm_parent) return;
+  lv_obj_clean(g_wm_parent);
+  g_wm_list=nullptr; g_wm_pass=nullptr; g_wmFocus=nullptr;
+
+  g_wm_status=lv_label_create(g_wm_parent);
+  lv_label_set_long_mode(g_wm_status,LV_LABEL_LONG_DOT); lv_obj_set_width(g_wm_status,lv_pct(100));
+  lv_obj_align(g_wm_status,LV_ALIGN_TOP_LEFT,0,0);
+  lv_obj_set_style_text_color(g_wm_status,lv_color_hex(g_accent),0);
+  lv_label_set_text_fmt(g_wm_status,"Password for %s:",g_wmSelSSID);
+
+  g_wm_pass=lv_textarea_create(g_wm_parent);
+  lv_textarea_set_one_line(g_wm_pass,true);
+  lv_textarea_set_password_mode(g_wm_pass,true);
+  lv_obj_set_width(g_wm_pass,lv_pct(100)); lv_obj_align(g_wm_pass,LV_ALIGN_TOP_LEFT,0,24);
+  lv_obj_set_style_bg_color(g_wm_pass,lv_color_hex(0x0E120E),0);
+  lv_obj_set_style_text_color(g_wm_pass,lv_color_hex(0xE0E0E0),0);
+  if(strcmp(g_wmSelSSID,g_wifiSSID)==0 && g_wifiPASS[0]) lv_textarea_set_text(g_wm_pass,g_wifiPASS);
+
+  lv_obj_t *br=lv_obj_create(g_wm_parent); lv_obj_remove_style_all(br);
+  lv_obj_set_size(br,lv_pct(100),34); lv_obj_align(br,LV_ALIGN_BOTTOM_MID,0,0);
+  lv_obj_set_flex_flow(br,LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(br,LV_FLEX_ALIGN_SPACE_EVENLY,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+  lv_obj_t *bc=lv_button_create(br); lv_obj_set_size(bc,120,30); lv_obj_set_style_bg_color(bc,lv_color_hex(0x1C6B34),0);
+  { lv_obj_t *l=lv_label_create(bc); lv_label_set_text(l,LV_SYMBOL_OK " Connect"); lv_obj_center(l); }
+  lv_obj_add_event_cb(bc,[](lv_event_t*){ wm_do_connect(); },LV_EVENT_CLICKED,nullptr);
+  lv_obj_t *bb=lv_button_create(br); lv_obj_set_size(bb,100,30); lv_obj_set_style_bg_color(bb,lv_color_hex(0x2A2A2A),0);
+  { lv_obj_t *l=lv_label_create(bb); lv_label_set_text(l,LV_SYMBOL_LEFT " Back"); lv_obj_center(l); }
+  lv_obj_add_event_cb(bb,[](lv_event_t*){ wm_go(wm_build_list); },LV_EVENT_CLICKED,nullptr);
+  g_wmFocus=g_wm_pass;
+}
+
+static void build_wifimgr(lv_obj_t *parent){
+  lv_obj_t *cont=lv_obj_create(parent); lv_obj_remove_style_all(cont);
+  lv_obj_set_size(cont,lv_pct(100),lv_pct(100)); lv_obj_set_style_bg_opa(cont,LV_OPA_TRANSP,0);
+  lv_obj_set_style_pad_top(cont,24,0);
+  lv_obj_clear_flag(cont,LV_OBJ_FLAG_SCROLLABLE);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false);
+  g_wm_parent=cont; g_wm_list=nullptr; g_wm_pass=nullptr; g_wmFocus=nullptr; g_wmNext=nullptr;
+  wm_build_list();
+}
+static void wifimgr_loop(){
+  if(g_mode!=MODE_WIFIMGR || !g_wm_status || g_wm_pass) return;   // only refresh the list view
+  static uint32_t last=0; uint32_t now=millis();
+  if(now-last<1500) return; last=now;
+  if(WiFi.status()==WL_CONNECTED)
+    lv_label_set_text_fmt(g_wm_status,"Connected: %s  %s",WiFi.SSID().c_str(),WiFi.localIP().toString().c_str());
+}
+static void wifimgr_exit(){
+  g_wm_parent=g_wm_list=g_wm_status=g_wm_pass=g_wmFocus=nullptr; g_wmNext=nullptr;
+}
+
 static void enter_mode(Mode m){
   if(m==MODE_LAUNCHER){back_to_launcher();return;}
   if(m!=MODE_MP3) mp3player::stop();             // free the codec for whatever this mode needs
@@ -2006,6 +2170,7 @@ static void enter_mode(Mode m){
   else if(m==MODE_SETTINGS){ build_settings(g_scr_mode); }
   else if(m==MODE_SDEXP){ build_sdexp(g_scr_mode); }
   else if(m==MODE_MP3){ build_mp3(g_scr_mode); }
+  else if(m==MODE_WIFIMGR){ build_wifimgr(g_scr_mode); }
   else if(m==MODE_CONTACTS){
     lv_obj_t *vaultPanel = lv_obj_create(g_scr_mode);
     lv_obj_set_size(vaultPanel, lv_pct(100), lv_pct(88));
@@ -2076,6 +2241,7 @@ static void back_to_launcher(){
   if(g_mode==MODE_BTRADAR) btradar::leave();
   if(g_mode==MODE_CC1101) ccradar::leave();
   if(g_mode==MODE_MP3) mp3_leave();
+  if(g_mode==MODE_WIFIMGR) wifimgr_exit();
   // Detach focus from soon-to-be-deleted widgets before destroying the mode screen.
   if (g_nav_group) lv_group_remove_all_objs(g_nav_group);
   if(g_launcherDirty){ g_launcherDirty=false; lv_obj_t*oldL=g_scr_launcher; build_launcher(); if(oldL && oldL!=g_scr_launcher) lv_obj_delete(oldL); }
@@ -2145,6 +2311,7 @@ void setup(){
   Serial.printf("[BOOT] reset reason: %s  SD: %s\n", reset_reason_str(g_resetReason), g_sdOk ? "ok" : "none");
 
   settings_load();   // restore saved theme + brightness before the splash
+  wifi_load_creds(); // restore last WiFi join (and NanoPi AP password)
   show_splash();
   build_launcher();
   lv_screen_load(g_scr_launcher);
@@ -2187,6 +2354,7 @@ void loop(){
     case MODE_BTRADAR:    btradar::loop();    break;
     case MODE_CC1101:     ccradar::loop();    break;
     case MODE_MP3:        mp3_loop();         break;
+    case MODE_WIFIMGR:    wifimgr_loop();     break;
     case MODE_LAUNCHER:
     default:
       break;

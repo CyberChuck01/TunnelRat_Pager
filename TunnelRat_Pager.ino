@@ -222,12 +222,13 @@ static void launcher_select_cb(lv_event_t *e) {
 }
 
 // --- menu organization: top-level folders, each holding related tools -------
-enum Cat { CAT_HUNT=0, CAT_ATTACK, CAT_RECON, CAT_SECURE, CAT_SYSTEM };
+enum Cat { CAT_HUNT=0, CAT_ATTACK, CAT_RECON, CAT_NFC, CAT_SECURE, CAT_SYSTEM };
 struct Folder { int id; const char *name; const char *txt; };
 static const Folder FOLDERS[] = {
   {CAT_HUNT,   "Signal Hunt",      LV_SYMBOL_WIFI     "  Signal Hunt        " LV_SYMBOL_RIGHT},
   {CAT_ATTACK, "Attacks",          LV_SYMBOL_WARNING  "  Attacks            " LV_SYMBOL_RIGHT},
   {CAT_RECON,  "Wardrive + Recon", LV_SYMBOL_GPS      "  Wardrive + Recon   " LV_SYMBOL_RIGHT},
+  {CAT_NFC,    "NFC",              LV_SYMBOL_SD_CARD  "  NFC read / write   " LV_SYMBOL_RIGHT},
   {CAT_SECURE, "Comms + Vault",    LV_SYMBOL_CALL     "  Comms + Vault      " LV_SYMBOL_RIGHT},
   {CAT_SYSTEM, "System",           LV_SYMBOL_SETTINGS "  System             " LV_SYMBOL_RIGHT},
 };
@@ -244,7 +245,7 @@ static const LItem LITEMS[] = {
   {LV_SYMBOL_BLUETOOTH " BLE Tools",                      MODE_BLE,          true,                 CAT_ATTACK},
   // Wardrive + Recon
   {LV_SYMBOL_GPS       "  Pager Wardrive (standalone)",   MODE_PAGER_WD,     true,                 CAT_RECON},
-  {LV_SYMBOL_SD_CARD   "  NFC Reader (read + write)",     MODE_NFC,          true,                 CAT_RECON},
+  {LV_SYMBOL_SD_CARD   "  NFC Reader (read + write)",     MODE_NFC,          true,                 CAT_NFC},
   {LV_SYMBOL_WIFI      "  Tunnel R.A.T. Remote (NanoPi)", MODE_TUNNELRAT,    true,                 CAT_RECON},
   // Comms + Vault
   {LV_SYMBOL_CALL      "  Comms (encrypted DM)",          MODE_COMMS,        true,                 CAT_SECURE},
@@ -589,6 +590,58 @@ static void nwd_start_cb(lv_event_t*){ nwd_run("START ALL",TR_NANOPI_WD_START); 
 static void nwd_stop_cb(lv_event_t*){  nwd_run("STOP ALL",TR_NANOPI_WD_STOP); }
 static void nwd_stat_cb(lv_event_t*){  nwd_run("STATUS",TR_NANOPI_WD_STATUS); }
 
+// ---- NanoPi remote tools (NETWORK / OSINT tabs) --------------------------
+static lv_obj_t *g_netOut=nullptr, *g_osintOut=nullptr;
+static const char *NET_TOOLS[][2]   = {{"LAN Scan","nmap-scan"},{"WiFi Scan","wifi-scan"},{"ARP","arp-table"},
+                                       {"Ports","ports"},{"Routes","routes"},{"DNS","dns-test"}};
+static const char *OSINT_TOOLS[][2] = {{"Ext IP","myip"},{"Real IP","myip-real"},{"Tor Start","tor-start"},
+                                       {"Tor NewID","tor-newid"},{"Tor IP","tor-ip"},{"Tor Stat","tor-status"}};
+
+// Run a dashboard action over /api/remote/run and show its output. Synchronous
+// (same pattern as the other remote calls); a scan can take several seconds.
+static void remote_tool(const char *action, lv_obj_t *outlbl){
+  if(!outlbl) return;
+  if(!g_uplink){ lv_label_set_text(outlbl,"Offline - join the " TR_AP_SSID " AP first (see HOME)."); return; }
+  lv_label_set_text_fmt(outlbl,"Running: %s ...", action);
+  lv_refr_now(NULL);                                 // paint "Running" before the blocking call
+  HTTPClient http; String url=String("http://")+TR_NANOPI_HOST+":"+TR_NANOPI_PORT+"/api/remote/run";
+  http.setConnectTimeout(2000); http.setTimeout(18000);
+  http.begin(url);
+  http.addHeader("Content-Type","application/json"); http.addHeader("X-API-Key",TR_API_KEY);
+  int code=http.POST(String("{\"action\":\"")+action+"\"}");
+  String resp = code>0 ? http.getString() : String("");
+  http.end();
+  if(code!=200){ lv_label_set_text_fmt(outlbl,"HTTP %d\n%s", code, resp.c_str()); return; }
+  DynamicJsonDocument doc(6144);
+  if(deserializeJson(doc, resp)!=DeserializationError::Ok){ lv_label_set_text(outlbl, resp.c_str()); return; }
+  if(doc["output"].is<const char*>())     lv_label_set_text(outlbl, (const char*)doc["output"]);
+  else if(doc["error"].is<const char*>()) lv_label_set_text_fmt(outlbl, "Error: %s", (const char*)doc["error"]);
+  else                                    lv_label_set_text(outlbl, resp.c_str());
+}
+static void net_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_user_data(e), g_netOut); }
+static void osint_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_user_data(e), g_osintOut); }
+
+static void build_tool_tab(lv_obj_t *tab, bool net){
+  lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(tab, 4, 0);
+  for(int row=0; row<2; row++){
+    lv_obj_t *r = make_row(tab, 34);
+    for(int c=0;c<3;c++){
+      int i=row*3+c;
+      const char *lbl = net ? NET_TOOLS[i][0] : OSINT_TOOLS[i][0];
+      const char *act = net ? NET_TOOLS[i][1] : OSINT_TOOLS[i][1];
+      make_button(r, lbl, 0x173017, net ? net_tool_cb : osint_tool_cb, (void*)act);
+    }
+  }
+  lv_obj_t *out = lv_label_create(tab);
+  lv_label_set_long_mode(out, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(out, lv_pct(100));
+  lv_obj_add_style(out, &st_dim, 0);
+  lv_label_set_text(out, net ? "Tap a network tool. Output appears here."
+                             : "Tap an OSINT tool. Output appears here.");
+  if(net) g_netOut=out; else g_osintOut=out;
+}
+
 static void build_remote(lv_obj_t *root){
   lv_obj_t *tv = lv_tabview_create(root);
   g_tv = tv;
@@ -596,16 +649,21 @@ static void build_remote(lv_obj_t *root){
   lv_obj_set_style_bg_color(tv, lv_color_hex(TR_THEME_BG), 0);
   lv_obj_set_size(tv, lv_pct(100), lv_pct(100));
   lv_obj_t *t_home = lv_tabview_add_tab(tv, "HOME");
-  lv_obj_t *t_wd   = lv_tabview_add_tab(tv, "NANOPI WARDRIVE");
-  lv_obj_t *t_rem  = lv_tabview_add_tab(tv, "REMOTE");
+  lv_obj_t *t_wd   = lv_tabview_add_tab(tv, "WARDRIVE");
+  lv_obj_t *t_net  = lv_tabview_add_tab(tv, "NETWORK");
+  lv_obj_t *t_os   = lv_tabview_add_tab(tv, "OSINT");
 
   lv_obj_set_flex_flow(t_home,LV_FLEX_FLOW_COLUMN);
   lbl_status = lv_label_create(t_home);
   lv_label_set_text(lbl_status, "TUNNEL R.A.T. REMOTE"); lv_obj_add_style(lbl_status, &st_accent, 0);
   lbl_uplink = make_tab_label(t_home, "Uplink: joining " TR_AP_SSID "...");
   lbl_gps    = make_tab_label(t_home, "Pager GPS: no fix");
-  make_tab_label(t_home, "This mode drives the NanoPi. The Pager feeds it GPS only;\n"
-                         "use PAGER WARDRIVE for the Pager's own radios.");
+  lbl_remote = lv_label_create(t_home);
+  lv_label_set_long_mode(lbl_remote, LV_LABEL_LONG_WRAP); lv_obj_set_width(lbl_remote, lv_pct(100));
+  lv_obj_add_style(lbl_remote, &st_dim, 0);
+  lv_label_set_text(lbl_remote, "Base station: connecting...");
+  make_tab_label(t_home, "NETWORK + OSINT drive the NanoPi's tools and show output here;\n"
+                         "WARDRIVE runs its radios. They work once uplink is CONNECTED.");
 
   lv_obj_set_flex_flow(t_wd,LV_FLEX_FLOW_COLUMN);
   make_tab_label(t_wd, "Starts/stops every wardrive module on the NanoPi.");
@@ -616,19 +674,8 @@ static void build_remote(lv_obj_t *root){
   lbl_nwd = make_tab_label(t_wd, "NanoPi wardrive: press STATUS");
   lv_label_set_long_mode(lbl_nwd, LV_LABEL_LONG_WRAP);
 
-  lbl_remote = lv_label_create(t_rem);
-  lv_label_set_long_mode(lbl_remote, LV_LABEL_LONG_WRAP); lv_obj_set_width(lbl_remote, lv_pct(100));
-  lv_obj_add_style(lbl_remote, &st_dim, 0);
-  lv_label_set_text(lbl_remote, "Base station: (refresh)");
-  const char *acts[][2] = {{"LAN Scan","nmap-scan"},{"Ext IP","myip"},
-                           {"Tor New ID","tor-newid"},{"WiFi Scan","wifi-scan"}};
-  for (int i=0;i<4;i++){
-    lv_obj_t *b=lv_button_create(t_rem); lv_obj_set_size(b,110,30);
-    lv_obj_align(b,LV_ALIGN_BOTTOM_LEFT,(i%2)*120,-(i/2)*36-4);
-    lv_obj_set_style_bg_color(b,lv_color_hex(0x173017),0);
-    lv_obj_t *bl=lv_label_create(b); lv_label_set_text(bl,acts[i][0]); lv_obj_center(bl);
-    lv_obj_add_event_cb(b,quick_action_cb,LV_EVENT_CLICKED,(void*)acts[i][1]);
-  }
+  build_tool_tab(t_net, true);
+  build_tool_tab(t_os,  false);
 }
 
 static const char *reset_reason_str(esp_reset_reason_t r){
@@ -1212,7 +1259,7 @@ static void cc_on_activity(const cc::Activity &a){
 // ===========================================================================
 static void refresh_remote(){
   if(g_mode!=MODE_TUNNELRAT||!lbl_remote)return;
-  if(!g_tv || lv_tabview_get_tab_active(g_tv)!=2) return;   // only poll while the tab is visible
+  if(!g_tv || lv_tabview_get_tab_active(g_tv)!=0) return;   // only poll while HOME is visible
   if(!g_uplink){lv_label_set_text(lbl_remote,"Base station: offline");return;}
   HTTPClient http; String url=String("http://")+TR_NANOPI_HOST+":"+TR_NANOPI_PORT+"/api/remote/status";
   http.setConnectTimeout(1500); http.setTimeout(2500);
@@ -1392,6 +1439,7 @@ static void remote_enter(){
 }
 static void remote_exit(){
   lbl_gps=lbl_uplink=lbl_status=lbl_remote=lbl_nwd=nullptr;
+  g_netOut=g_osintOut=nullptr;
   g_tv=nullptr;
 }
 static void remote_loop(){

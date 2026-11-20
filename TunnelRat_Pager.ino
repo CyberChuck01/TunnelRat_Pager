@@ -605,13 +605,18 @@ static void nwd_start_cb(lv_event_t*){ nwd_run("START ALL",TR_NANOPI_WD_START); 
 static void nwd_stop_cb(lv_event_t*){  nwd_run("STOP ALL",TR_NANOPI_WD_STOP); }
 static void nwd_stat_cb(lv_event_t*){  nwd_run("STATUS",TR_NANOPI_WD_STATUS); }
 
-// ---- NanoPi remote tools (NETWORK / OSINT tabs) --------------------------
-static lv_obj_t *g_netOut=nullptr, *g_osintOut=nullptr;
+// ---- NanoPi remote tools (NETWORK / OSINT / DEFENSE / OFFENSE tabs) -------
+static lv_obj_t *g_netOut=nullptr, *g_osintOut=nullptr, *g_defOut=nullptr, *g_offOut=nullptr;
 static const char *NET_TOOLS[][2]   = {{"LAN Scan","nmap-scan"},{"WiFi Scan","wifi-scan"},{"ARP","arp-table"},
                                        {"Ports","ports"},{"Routes","routes"},{"DNS","dns-test"}};
 static const char *OSINT_TOOLS[][2] = {{"Ext IP","myip"},{"Real IP","myip-real"},{"GeoIP","geoip"},
                                        {"Tor Start","tor-start"},{"Tor NewID","tor-newid"},{"Tor IP","tor-ip"},
                                        {"Tor Stat","tor-status"}};
+static const char *DEF_TOOLS[][2]   = {{"Suricata On","suricata-start"},{"Suricata Off","suricata-stop"},{"Suricata?","suricata-status"},
+                                       {"ClamAV","clamav-scan"},{"Zeek","zeek-check"},{"Snort","snort"},
+                                       {"YARA","yara"}};
+static const char *OFF_TOOLS[][2]   = {{"Bettercap","bettercap-ver"},{"Aircrack","aircrack"},{"Responder","responder-check"},
+                                       {"hostapd","hostapd-check"},{"mitmproxy","mitmproxy-ver"},{"hashcat","hashcat"}};
 
 // Run a dashboard action over /api/remote/run and show its output. Synchronous
 // (same pattern as the other remote calls); a scan can take several seconds.
@@ -636,26 +641,25 @@ static void remote_tool(const char *action, lv_obj_t *outlbl){
 }
 static void net_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_user_data(e), g_netOut); }
 static void osint_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_user_data(e), g_osintOut); }
+static void def_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_user_data(e), g_defOut); }
+static void off_tool_cb(lv_event_t *e){ remote_tool((const char*)lv_event_get_user_data(e), g_offOut); }
 
-static void build_tool_tab(lv_obj_t *tab, bool net){
+// Generic tool grid: 3 buttons per row + a scrollable output label.
+static void build_tool_tab(lv_obj_t *tab, const char *tools[][2], int count,
+                           lv_obj_t **outslot, lv_event_cb_t cb, const char *hint){
   lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(tab, 4, 0);
-  int count = net ? 6 : 7;
   for(int i=0;i<count;){
     lv_obj_t *r = make_row(tab, 32);
-    for(int c=0;c<3 && i<count;c++,i++){
-      const char *lbl = net ? NET_TOOLS[i][0] : OSINT_TOOLS[i][0];
-      const char *act = net ? NET_TOOLS[i][1] : OSINT_TOOLS[i][1];
-      make_button(r, lbl, 0x173017, net ? net_tool_cb : osint_tool_cb, (void*)act);
-    }
+    for(int c=0;c<3 && i<count;c++,i++)
+      make_button(r, tools[i][0], 0x173017, cb, (void*)tools[i][1]);
   }
   lv_obj_t *out = lv_label_create(tab);
   lv_label_set_long_mode(out, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(out, lv_pct(100));
   lv_obj_add_style(out, &st_dim, 0);
-  lv_label_set_text(out, net ? "Tap a network tool. Output appears here."
-                             : "Tap an OSINT tool. Output appears here.");
-  if(net) g_netOut=out; else g_osintOut=out;
+  lv_label_set_text(out, hint);
+  *outslot = out;
 }
 
 static void build_remote(lv_obj_t *root){
@@ -668,6 +672,8 @@ static void build_remote(lv_obj_t *root){
   lv_obj_t *t_wd   = lv_tabview_add_tab(tv, "WARDRIVE");
   lv_obj_t *t_net  = lv_tabview_add_tab(tv, "NETWORK");
   lv_obj_t *t_os   = lv_tabview_add_tab(tv, "OSINT");
+  lv_obj_t *t_def  = lv_tabview_add_tab(tv, "DEFENSE");
+  lv_obj_t *t_off  = lv_tabview_add_tab(tv, "OFFENSE");
 
   lv_obj_set_flex_flow(t_home,LV_FLEX_FLOW_COLUMN);
   lbl_status = lv_label_create(t_home);
@@ -690,8 +696,10 @@ static void build_remote(lv_obj_t *root){
   lbl_nwd = make_tab_label(t_wd, "NanoPi wardrive: press STATUS");
   lv_label_set_long_mode(lbl_nwd, LV_LABEL_LONG_WRAP);
 
-  build_tool_tab(t_net, true);
-  build_tool_tab(t_os,  false);
+  build_tool_tab(t_net, NET_TOOLS,   6, &g_netOut,   net_tool_cb,   "Tap a network tool. Output appears here.");
+  build_tool_tab(t_os,  OSINT_TOOLS, 7, &g_osintOut, osint_tool_cb, "Tap an OSINT tool. Output appears here.");
+  build_tool_tab(t_def, DEF_TOOLS,   7, &g_defOut,   def_tool_cb,   "NanoPi defensive suite. Output appears here.");
+  build_tool_tab(t_off, OFF_TOOLS,   6, &g_offOut,   off_tool_cb,   "NanoPi offensive utilities. Output appears here.");
 }
 
 static const char *reset_reason_str(esp_reset_reason_t r){
@@ -1461,7 +1469,7 @@ static void remote_enter(){
 }
 static void remote_exit(){
   lbl_gps=lbl_uplink=lbl_status=lbl_remote=lbl_nwd=nullptr;
-  g_netOut=g_osintOut=nullptr;
+  g_netOut=g_osintOut=g_defOut=g_offOut=nullptr;
   g_tv=nullptr;
 }
 static void remote_loop(){

@@ -4,7 +4,7 @@ Browser-based installer for TunnelRat_Pager, built on
 [ESP Web Tools](https://esphome.github.io/esp-web-tools/). Served via GitHub
 Pages from this `docs/` folder at:
 
-**https://cyberchuck01.github.io/TunnelRat_Pager/**
+**https://cyberchuck01.github.io/TunnelRat_Pager/docs/**
 
 ## How the binary is produced
 

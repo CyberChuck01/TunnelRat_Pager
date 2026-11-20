@@ -71,7 +71,7 @@ card: `/music` or `/audio` for the MP3 player.
 A browser‑based installer (no toolchain required, Chrome/Edge over USB) lives
 under [`docs/`](docs/) and is published with GitHub Pages:
 
-**→ https://cyberchuck01.github.io/TunnelRat_Pager/**
+**→ https://cyberchuck01.github.io/TunnelRat_Pager/docs/**
 
 It flashes a prebuilt binary; see [`docs/README.md`](docs/README.md) for how the
 binary is produced and updated.
